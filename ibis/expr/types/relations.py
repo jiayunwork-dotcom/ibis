@@ -915,6 +915,57 @@ class Table(Expr, _FixedTextJupyterMixin):
         else:
             return ops.SelfReference(self).to_expr()
 
+    def recurse(self, step, *, max_iterations: int = 1000) -> Table:
+        """Compute the recursive closure of this table under ``step``.
+
+        The table the method is called on is the *seed* (starting set of
+        records). ``step`` is called exactly once while the expression is
+        built -- never executed -- and receives a placeholder table with the
+        same schema as the seed. The placeholder represents **all distinct
+        records discovered so far** (not just the previous round's increment);
+        the result of each application is merged into that set until an
+        application contributes no new records.
+
+        Parameters
+        ----------
+        step
+            A callable taking the recursive placeholder table and returning
+            a table with the same column names, order and base types as the
+            seed. It may project, rename columns, use deterministic row-wise
+            expressions and filters, inner/left join with fixed relations,
+            apply distinct/union, and inner self-join two views of the
+            placeholder. The placeholder must be used at least once and at
+            most twice (each join side counts as one use). Nested recursion,
+            grouping reductions, window functions, ordering, limit and
+            non-deterministic (random) expressions are rejected.
+        max_iterations
+            Maximum number of times ``step`` is applied, counting the final
+            application that adds no new records. Must be a positive integer
+            (booleans are rejected). If the budget is spent while the last
+            application still added records, execution raises an error rather
+            than returning the partial set.
+
+        Returns
+        -------
+        Table
+            The finite set of distinct records reachable from the seed.
+            Duplicates are judged on all columns with NULLs in the same
+            position considered equal.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> edges = ibis.table({"child": "int64", "parent": "int64"}, name="edges")
+        >>> seeds = ibis.table({"node": "int64"}, name="seeds")
+        >>> closure = seeds.recurse(
+        ...     lambda known: known.join(edges, known.node == edges.child).select(node=edges.parent)
+        ... )
+        """
+        from ibis.expr.recursion import build_recursion
+
+        node = build_recursion(self, step, max_iterations)
+        return Table(node)
+
     def aggregate(
         self,
         metrics: Sequence[ir.Scalar] | None = (),

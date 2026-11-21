@@ -15,6 +15,12 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.pandas.rewrites import PandasAsofJoin, PandasJoin, PandasRename
+from ibis.backends.polars.recursion import (
+    _RECURSION_BY_UID,
+    current_placeholder_frames,
+    evaluate_recursion,
+)
+from ibis.backends.sql import rewrites as sqlrw
 from ibis.backends.sql.compilers.base import STAR
 from ibis.backends.sql.dialects import Polars
 from ibis.expr.operations.udf import InputType
@@ -1273,6 +1279,26 @@ def execute_view(op, *, ctx: pl.SQLContext, **kw):
 @translate.register(ops.Reference)
 def execute_reference(op, **kw):
     return translate(op.parent, **kw)
+
+
+@translate.register(ops.RecursiveRelation)
+def execute_recursive_relation(op, *, ctx, **_):
+    return evaluate_recursion(op, ctx=ctx, translate=translate)
+
+
+@translate.register(sqlrw.RecursiveClosureRef)
+def execute_recursive_closure_ref(op, *, ctx, **_):
+    # nested recursion inside a step: evaluate it as an independent fixed point
+    nested = _RECURSION_BY_UID[op.uid]
+    return evaluate_recursion(nested, ctx=ctx, translate=translate)
+
+
+@translate.register(sqlrw.RecursivePlaceholderRef)
+def execute_recursive_placeholder_ref(op, **_):
+    frames = current_placeholder_frames()
+    if op not in frames:  # pragma: no cover - defensive
+        raise com.TranslationError("recursive placeholder escaped its recursion scope")
+    return frames[op]
 
 
 @translate.register(ops.CountDistinctStar)

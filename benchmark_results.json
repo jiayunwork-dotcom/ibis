@@ -1,0 +1,43 @@
+100% ▕████████████████████████████████████████████████████████████▏ 
+[
+  {
+    "backend": "duckdb://",
+    "n": 1000,
+    "result_rows": 1000,
+    "expected_rounds": 1001,
+    "plan_nodes": 12,
+    "seconds": 1.506,
+    "peak_rss_mb": 235.9,
+    "ms_per_round": 1.504
+  },
+  {
+    "backend": "duckdb://",
+    "n": 10000,
+    "result_rows": 10000,
+    "expected_rounds": 10001,
+    "plan_nodes": 12,
+    "seconds": 15.285,
+    "peak_rss_mb": 263.6,
+    "ms_per_round": 1.528
+  },
+  {
+    "backend": "polars://",
+    "n": 1000,
+    "result_rows": 1000,
+    "expected_rounds": 1001,
+    "plan_nodes": 12,
+    "seconds": 1.114,
+    "peak_rss_mb": 311.8,
+    "ms_per_round": 1.113
+  },
+  {
+    "backend": "polars://",
+    "n": 10000,
+    "result_rows": 10000,
+    "expected_rounds": 10001,
+    "plan_nodes": 12,
+    "seconds": 17.779,
+    "peak_rss_mb": 341.6,
+    "ms_per_round": 1.778
+  }
+]

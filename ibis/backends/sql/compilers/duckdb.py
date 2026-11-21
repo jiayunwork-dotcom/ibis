@@ -40,6 +40,9 @@ class DuckDBCompiler(SQLGlotCompiler):
     dialect = DuckDB
     type_mapper = DuckDBType
 
+    # DuckDB executes the recursive CTE itself; no Python-side fixed point
+    supports_recursion = True
+
     agg = AggGen(supports_filter=True, supports_order_by=True)
 
     supports_qualify = True

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import operator
 from collections.abc import Mapping
 from functools import reduce
@@ -14,11 +15,12 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.common.annotations import attribute
-from ibis.common.collections import FrozenDict  # noqa: TCH001
+from ibis.common.collections import FrozenDict, FrozenOrderedDict
 from ibis.common.deferred import var
 from ibis.common.graph import Graph
+from ibis.common.graph import Node as TraversableNode
 from ibis.common.patterns import InstanceOf, Object, Pattern, replace
-from ibis.common.typing import VarTuple  # noqa: TCH001
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.rewrites import d, p, replace_parameter
 from ibis.expr.schema import Schema
 
@@ -42,6 +44,50 @@ class CTE(ops.Relation):
     @attribute
     def values(self):
         return self.parent.values
+
+
+@public
+class RecursiveClosureRef(ops.Relation):
+    """Backend-local marker standing for the result of a recursive CTE.
+
+    The node replaces an :class:`ibis.expr.operations.RecursiveRelation` while
+    lowering an expression for a SQL backend. It only records the generated
+    CTE name; the actual recursive definition is attached to the enclosing
+    statement by the compiler. The original expression graph is never
+    modified.
+    """
+
+    name: str
+    schema: Schema
+    uid: int
+    budget: int
+
+    @attribute
+    def values(self):
+        return FrozenOrderedDict(
+            {col: ops.Field(self, col) for col in self.schema.names}
+        )
+
+
+@public
+class RecursivePlaceholderRef(ops.Relation):
+    """Backend-local marker for one usage of a recursive CTE inside its step.
+
+    Each occurrence of the placeholder gets its own marker (self joins get two
+    markers and therefore two aliases), but ``uid`` ties every marker to the
+    recursion that owns it.
+    """
+
+    name: str
+    schema: Schema
+    uid: int
+    alias: str
+
+    @attribute
+    def values(self):
+        return FrozenOrderedDict(
+            {col: ops.Field(self, col) for col in self.schema.names}
+        )
 
 
 @public
@@ -339,6 +385,111 @@ def extract_ctes(node: ops.Relation) -> set[ops.Relation]:
             result.add(op)
 
     return result
+
+
+def lower_recursion(
+    node: ops.Relation, name_for
+) -> tuple[ops.Relation, list[ops.RecursiveRelation]]:
+    """Replace recursion nodes with backend-local marker relations.
+
+    The rewrite is pure: a new graph is returned and the caller's graph is
+    left untouched. ``name_for`` maps a placeholder uid to the generated CTE
+    name. Every *usage* of a placeholder becomes a distinct marker so that the
+    two sides of a self join keep independent aliases (the structural sharing
+    of the placeholder node is deliberately broken), while the ``uid``
+    preserves ownership.
+    """
+    recursions = list(dict.fromkeys(node.find(ops.RecursiveRelation)))
+    counter = itertools.count()
+
+    def make_marker(placeholder: ops.RecursivePlaceholder) -> RecursivePlaceholderRef:
+        return RecursivePlaceholderRef(
+            name=name_for(placeholder.uid),
+            schema=placeholder.schema,
+            uid=placeholder.uid,
+            alias=f"rph_{placeholder.uid}_{next(counter)}",
+        )
+
+    # Node.replace memoizes by node identity, so it cannot produce two
+    # different markers for two usages of the same placeholder. The walk below
+    # rebuilds the graph bottom-up with two memo tables:
+    #
+    # * ``memo`` keeps the structural sharing of ordinary nodes (including the
+    #   rebuilt markers), so Field references always resolve to the rebuilt
+    #   parent relation;
+    # * ``reference_memo`` re-keys a relation when it is reached through a
+    #   Reference boundary, which is exactly where a new usage position starts
+    #   (the two sides of a self join are two References around the same
+    #   placeholder).
+    # The graph is rebuilt bottom-up. Ordinary nodes keep their structural
+    # sharing through ``memo``. RecursivePlaceholder nodes are the exception:
+    # each *relation edge* entering a placeholder starts a fresh marker
+    # (reusing the same placeholder on two join sides therefore yields two
+    # markers). Every subtree hanging off such an edge is rebuilt together, so
+    # the Fields of a rebuilt projection always point at the rebuilt marker.
+    memo: dict[ops.Node, ops.Node] = {}
+
+    def rebuild(current: ops.Node, *, fresh_placeholder: bool = False) -> ops.Node:
+        if isinstance(current, ops.RecursiveRelation):
+            uid = current.placeholder.uid
+            return RecursiveClosureRef(
+                name=name_for(uid),
+                schema=current.schema,
+                uid=uid,
+                budget=current.max_iterations,
+            )
+        if isinstance(current, ops.RecursivePlaceholder):
+            if fresh_placeholder:
+                return make_marker(current)
+            if current not in memo:
+                memo[current] = make_marker(current)
+            return memo[current]
+        if not fresh_placeholder and current in memo:
+            return memo[current]
+
+        # a Reference boundary, or a relation whose direct parent is a
+        # placeholder, marks an independent usage position: everything below
+        # must be rebuilt with fresh placeholder markers
+        opens_fresh = isinstance(current, (ops.Reference,)) and _contains_placeholder(
+            current
+        )
+
+        rebuilt_args = {}
+        for argname, value in zip(current.__argnames__, current.__args__):
+            child_fresh = fresh_placeholder or (opens_fresh and argname == "parent")
+            rebuilt_args[argname] = _rebuild_value(
+                value, rebuild, fresh_placeholder=child_fresh
+            )
+        result = current.__recreate__(rebuilt_args)
+        if not fresh_placeholder:
+            memo[current] = result
+        return result
+
+    lowered = rebuild(node)
+    return lowered, recursions
+
+
+def _contains_placeholder(node: ops.Node) -> bool:
+    return bool(node.find(ops.RecursivePlaceholder))
+
+
+def _rebuild_value(value, rebuild, *, fresh_placeholder: bool = False):
+    if isinstance(value, TraversableNode):
+        return rebuild(value, fresh_placeholder=fresh_placeholder)
+    if isinstance(value, (tuple, list)):
+        new = [
+            _rebuild_value(item, rebuild, fresh_placeholder=fresh_placeholder)
+            for item in value
+        ]
+        return type(value)(new)
+    if isinstance(value, (dict, FrozenDict)):
+        return type(value)(
+            {
+                key: _rebuild_value(item, rebuild, fresh_placeholder=fresh_placeholder)
+                for key, item in value.items()
+            }
+        )
+    return value
 
 
 def sqlize(

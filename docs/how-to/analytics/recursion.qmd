@@ -1,0 +1,128 @@
+# Recursive relations
+
+Ibis can compute transitive closures and other fixed-point relations with
+`Table.recurse`. Given a starting set of records (the table you call
+`.recurse` on) and a `step` function, Ibis repeatedly applies the step until no
+new records are produced, returning the finite set of distinct records
+discovered.
+
+## When to use it
+
+`recurse` is the right tool when a relation is defined in terms of itself:
+
+* graph traversal such as finding every ancestor of a node through a
+  child-to-parent edge table;
+* transitive closure, reachability, bill-of-materials expansion;
+* any fixed point where each round combines the records found so far.
+
+## Basic example: all ancestors
+
+Given an edge table `edges(child, parent)` and a table of starting nodes, the
+step joins the currently known nodes to the edges and projects the parents:
+
+```python
+import ibis
+
+seeds = ibis.table({"node": "int64"}, name="seeds")
+edges = ibis.table(
+    {"child": "int64", "parent": "int64"}, name="edges"
+)
+
+ancestors = seeds.recurse(
+    lambda known: known.join(
+        edges, known.node == edges.child
+    ).select(node=edges.parent)
+)
+```
+
+The result always includes the seed rows together with every distinct node
+reachable from them. Cycles, diamonds and duplicate edges are handled: a
+record already present is never added a second time.
+
+## The step receives the whole discovered set
+
+The `step` callable receives a placeholder standing for **all records found
+so far**, not just the rows added by the previous round. This is what makes a
+step that depends on the entire closure (for example a self join that combines
+discovered relations) behave correctly.
+
+```python
+# inner self join of two views of the placeholder
+pairs = seeds.recurse(
+    lambda known: known.join(
+        known.view(), [("node", "node")]
+    ).select("node")
+)
+```
+
+The step is constructed once (it is never executed in Python to build the
+expression graph) and may use:
+
+* projection, rename, row-wise deterministic expressions and filters;
+* inner or cross joins, including inner/cross self joins on two placeholder
+  views (at most two placeholder references);
+* inner or left joins against fixed relations;
+* `distinct` and `union`.
+
+Nested recursion, grouping/reductions, window functions, ordering, `limit` and
+non-deterministic (random) expressions are rejected while the expression is
+being built, raising `ibis.common.exceptions.IbisInputError`.
+
+## Distinctness and NULLs
+
+Records are deduplicated on all columns. Two rows compare equal when every
+column matches, with NULLs in the same position treated as equal
+(NULL-safe, like SQL `IS NOT DISTINCT FROM`). Output ordering is not
+guaranteed.
+
+Only `int64`, `string` and `boolean` columns are supported. The step result
+must have the same column names, order and base types as the seed; no implicit
+conversion is performed. Nullability is widened so the closure can hold a NULL
+that either side may produce.
+
+## The iteration budget
+
+`max_iterations` is a positive integer (booleans are rejected even though they
+are `int` subclasses). It counts the number of step *applications*, including
+the final application that adds no records:
+
+* seed `{1}`, identity step `step = known` converges after one application, so
+  `max_iterations=1` succeeds;
+* a chain that adds a new node on each of five rounds needs six applications
+  (five that add, one that adds nothing), so `max_iterations=6` succeeds while
+  `max_iterations=5` raises an execution error rather than returning the
+  partial set.
+
+An empty seed still causes the step to be evaluated once, and returns an empty
+result.
+
+```python
+converged = seeds.recurse(step, max_iterations=100)
+```
+
+## Composing with ordinary relations
+
+The closure is an ordinary table expression, so filtering, projection,
+aggregation, joins and views all compose normally. The convergence check is
+part of the compiled relation, so an outer `limit` or filter cannot bypass the
+budget:
+
+```python
+summary = ancestors.aggregate(n=ancestors.node.count())
+limited = ancestors.filter(ancestors.node > 0).limit(10)
+```
+
+## Backends
+
+Recursion is currently implemented for the DuckDB and Polars backends.
+
+* On **DuckDB** the fixed point runs inside the database as a
+  `WITH RECURSIVE` query; `compile` produces SQL and no Python-side fixed-point
+  loop or whole-table fetch is involved.
+* On **Polars** the fixed point is driven by the backend executing native lazy
+  relation plans round by round. The step stays a `LazyFrame`; rows are never
+  pulled into Python lists, and only the small convergence probes and the final
+  closure are collected.
+
+Both backends return the same distinct record sets, column structures and
+budget behavior.

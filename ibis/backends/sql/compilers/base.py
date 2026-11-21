@@ -17,6 +17,8 @@ import ibis.common.exceptions as com
 import ibis.common.patterns as pats
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+from ibis.backends.sql import rewrites as sqlrw
+from ibis.backends.sql.recursion import RecursiveCTEBuilder
 from ibis.backends.sql.rewrites import (
     FirstValue,
     LastValue,
@@ -74,7 +76,7 @@ class AggGen:
     class _Accessor:
         """An internal type to handle getattr/getitem access."""
 
-        __slots__ = ("handler", "compiler")
+        __slots__ = ("compiler", "handler")
 
         def __init__(self, handler: Callable, compiler: SQLGlotCompiler):
             self.handler = handler
@@ -169,7 +171,7 @@ class AnonymousFuncGen:
 
 
 class FuncGen:
-    __slots__ = ("namespace", "anon", "copy")
+    __slots__ = ("anon", "copy", "namespace")
 
     def __init__(self, namespace: str | None = None, copy: bool = False) -> None:
         self.namespace = namespace
@@ -192,9 +194,9 @@ class FuncGen:
         first, *rest = args
 
         if isinstance(first, sge.Select):
-            assert (
-                not rest
-            ), "only one argument allowed when `first` is a select statement"
+            assert not rest, (
+                "only one argument allowed when `first` is a select statement"
+            )
 
         return sge.Array(expressions=list(map(sge.convert, (first, *rest))))
 
@@ -234,7 +236,12 @@ STAR = sge.Star()
 
 @public
 class SQLGlotCompiler(abc.ABC):
-    __slots__ = "f", "v"
+    __slots__ = (
+        "_recursion_guards",
+        "_recursion_placeholder_sql",
+        "f",
+        "v",
+    )
 
     agg = AggGen()
     """A generator for handling aggregate functions"""
@@ -575,6 +582,195 @@ class SQLGlotCompiler(abc.ABC):
         assert not isinstance(sql, sge.Subquery)
         return sql
 
+    supports_recursion: ClassVar[bool] = False
+
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        # subclasses declare empty __slots__, so initialize the recursion
+        # translation state through the base slots regardless of their
+        # __init__ behavior
+        object.__setattr__(instance, "_recursion_placeholder_sql", {})
+        object.__setattr__(instance, "_recursion_guards", {})
+        return instance
+
+    # active recursion translation state. ``_recursion_placeholder_sql`` maps
+    # a lowered placeholder marker to its compiled SQL; ``_recursion_guards``
+    # maps a lowered closure-ref node to its convergence-guard predicate. Both
+    # are populated only while a recursive statement is being translated and
+    # are reset before/after every such translation.
+    _recursion_placeholder_sql: dict
+    _recursion_guards: dict
+
+    def _recursive_cte_name(self, uid: int) -> str:
+        return f"ibis_recurse_{uid}"
+
+    def translate_relation_subgraph(self, op: ops.Relation) -> sge.Expression:
+        """Translate an isolated relation graph (e.g. a recursion seed).
+
+        The subgraph is lowered through the same SQL rewrites as the enclosing
+        expression but translated independently, so its CTEs stay scoped to the
+        recursive definition rather than leaking into the outer statement.
+        """
+        lowered, ctes = sqlize(
+            op,
+            params={},
+            rewrites=self.rewrites,
+            post_rewrites=self.post_rewrites,
+            fuse_selects=options.sql.fuse_selects,
+        )
+        return self._translate_lowered(lowered, ctes)
+
+    def translate_recursive_step(
+        self,
+        step: ops.Relation,
+        *,
+        placeholder: ops.RecursivePlaceholder,
+        placeholder_sql: sge.Expression,
+        cte_name: str,
+    ) -> sge.Expression:
+        """Translate the step body with its placeholder bound to a SQL view."""
+        lowered, _ = sqlrw.lower_recursion(step, name_for=self._recursive_cte_name)
+        # run the standard SQL lowering (Project -> Select, Filter -> Select,
+        # CTE extraction, ...) on the recursion-free step graph
+        lowered, step_ctes = sqlize(
+            lowered,
+            params={},
+            rewrites=self.rewrites,
+            post_rewrites=self.post_rewrites,
+            fuse_selects=options.sql.fuse_selects,
+        )
+        placeholder_markers = lowered.find(sqlrw.RecursivePlaceholderRef)
+        if not placeholder_markers:  # pragma: no cover - guarded at build time
+            raise com.TranslationError(
+                "recursive placeholder disappeared while compiling the step"
+            )
+        # translate the lowered step, substituting each marker usage with an
+        # aliased subquery over the recursive CTE. The mapping is held on the
+        # compiler instance because translation walks the graph bottom-up.
+        previous = self._recursion_placeholder_sql
+        self._recursion_placeholder_sql = {
+            marker: placeholder_sql.subquery(marker.alias, copy=False)
+            for marker in placeholder_markers
+        }
+        try:
+            translated = self._translate_lowered(lowered, step_ctes)
+        finally:
+            self._recursion_placeholder_sql = previous
+        return translated
+
+    def _translate_lowered(self, op, ctes) -> sge.Expression:
+        aliases = {}
+        counter = itertools.count()
+
+        def fn(node, _, **kwargs):
+            result = self.visit_node(node, **kwargs)
+            if node is op or not isinstance(node, ops.Relation):
+                return result
+            alias = node.name if isinstance(node, ops.View) else f"t{next(counter)}"
+            aliases[node] = alias
+            alias = sg.to_identifier(alias, quoted=self.quoted)
+            if isinstance(result, sge.Subquery):
+                return result.as_(alias, quoted=self.quoted)
+            try:
+                return result.subquery(alias, copy=False)
+            except AttributeError:
+                return result.as_(alias, quoted=self.quoted)
+
+        results = op.map(fn)
+        out = results[op]
+        if isinstance(out, sge.Table):
+            out = sg.select(STAR, copy=False).from_(out, copy=False)
+        elif isinstance(out, sge.Subquery):
+            out = out.this
+        for cte in ctes:
+            alias = sg.to_identifier(aliases[cte], quoted=self.quoted)
+            out = out.with_(
+                alias,
+                as_=results[cte].this,
+                dialect=self.dialect,
+                copy=False,
+            )
+        return out
+
+    def _translate_with_recursion(self, op, params):
+        """Lower recursion nodes and assemble WITH RECURSIVE definitions."""
+        recursions = list(dict.fromkeys(op.find(ops.RecursiveRelation)))
+        builder = RecursiveCTEBuilder(self)
+        for rec in recursions:
+            builder.build(rec)
+
+        # closure refs carry the closure CTE name; the lowering only needs a
+        # single name per uid
+        lowered, _pre = sqlrw.lower_recursion(op, name_for=builder.closure_name)
+        # run the ordinary SQL lowering on the recursion-free graph; marker
+        # relations survive because they are ordinary ops.Relation nodes
+        lowered, ctes = sqlize(
+            lowered,
+            params=params,
+            rewrites=self.rewrites,
+            post_rewrites=self.post_rewrites,
+            fuse_selects=options.sql.fuse_selects,
+        )
+
+        # every recursive CTE reference in the outer graph needs a convergence
+        # guard applied to the read of that CTE
+        self._recursion_guards = {
+            ref: builder.guard_predicate(ref.uid)
+            for ref in lowered.find(sqlrw.RecursiveClosureRef)
+        }
+        try:
+            out = self._translate_lowered(lowered, ctes)
+        finally:
+            self._recursion_guards = {}
+            self._recursion_placeholder_sql = {}
+
+        # attach both CTEs of every recursion in discovery order. Each is a
+        # recursive CTE; the depth CTE references its sibling closure CTE.
+        for rec in recursions:
+            uid = rec.placeholder.uid
+            closure_name, depth_name = builder.names_for(uid)
+            out = out.with_(
+                sg.to_identifier(closure_name, quoted=self.quoted),
+                as_=builder.closure_defs[uid],
+                recursive=True,
+                dialect=self.dialect,
+                copy=False,
+            )
+            out = out.with_(
+                sg.to_identifier(depth_name, quoted=self.quoted),
+                as_=builder.depth_defs[uid],
+                recursive=True,
+                dialect=self.dialect,
+                copy=False,
+            )
+        return out
+
+    def visit_RecursiveClosureRef(self, op, *, name, schema, uid, budget):
+        guard = self._recursion_guards.get(op)
+        if guard is None:  # pragma: no cover - defensive
+            raise com.TranslationError(
+                "recursive closure reference escaped its translation scope"
+            )
+        # read the distinct closure's user columns; the depth CTE and all
+        # tracking columns stay internal. The guard is a self-contained scalar
+        # subquery and survives outer LIMIT/filter pushdown.
+        return (
+            sg.select(
+                *[sg.column(col, quoted=self.quoted) for col in schema.names],
+                copy=False,
+            )
+            .from_(sg.table(name, quoted=self.quoted), copy=False)
+            .where(guard, copy=False)
+        )
+
+    def visit_RecursivePlaceholderRef(self, op, *, name, schema, uid, alias):
+        try:
+            return self._recursion_placeholder_sql[op]
+        except KeyError:  # pragma: no cover - defensive
+            raise com.TranslationError(
+                "recursive placeholder escaped its recursion scope"
+            ) from None
+
     def translate(self, op, *, params: Mapping[ir.Value, Any]) -> sge.Expression:
         """Translate an ibis operation to a sqlglot expression.
 
@@ -602,6 +798,10 @@ class SQLGlotCompiler(abc.ABC):
         params = self._prepare_params(params)
         if self.lowered_ops:
             op = op.replace(reduce(operator.or_, self.lowered_ops.values()))
+
+        if self.supports_recursion and op.find(ops.RecursiveRelation):
+            return self._translate_with_recursion(op, params)
+
         op, ctes = sqlize(
             op,
             params=params,

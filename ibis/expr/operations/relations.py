@@ -24,7 +24,7 @@ from ibis.common.typing import Coercible, VarTuple
 from ibis.expr.operations.core import Alias, Column, Node, Scalar, Value
 from ibis.expr.operations.sortkeys import SortKey
 from ibis.expr.schema import Schema
-from ibis.formats import TableProxy  # noqa: TCH001
+from ibis.formats import TableProxy  # noqa: TC001
 
 T = TypeVar("T")
 
@@ -169,7 +169,7 @@ class DropColumns(Relation):
 class Reference(Relation):
     _uid_counter = itertools.count()
     parent: Relation
-    identifier: Optional[int] = None
+    identifier: int | None = None
 
     def __init__(self, parent, identifier):
         if identifier is None:
@@ -376,6 +376,87 @@ class Difference(Set):
 
 
 @public
+class RecursivePlaceholder(Relation):
+    """A relation standing for the currently discovered set of a recursion.
+
+    The node is only valid inside the ``step`` expression of the
+    :class:`RecursiveRelation` it belongs to. Identity is established through
+    the unique ``uid``, never through a table name: two recursions may use the
+    same names but their placeholders can never bind to each other.
+    """
+
+    _uid_counter = itertools.count()
+
+    schema: Schema
+    uid: int
+
+    @classmethod
+    def create(cls, schema):
+        return cls(schema=schema, uid=next(cls._uid_counter))
+
+    values = FrozenOrderedDict()
+
+
+@public
+class RecursiveRelation(Relation):
+    """A fixed-point closure computed by repeatedly applying ``step``.
+
+    ``seed`` is the starting set of records. ``step`` is an arbitrary relation
+    expression that references ``placeholder`` (the accumulated, deduplicated
+    set of records discovered so far) one or two times. The recursion stops
+    once an application of ``step`` produces no new records, or raises an
+    execution error if the budget of ``max_iterations`` applications is spent
+    while new records are still being added.
+    """
+
+    seed: Relation
+    step: Relation
+    placeholder: RecursivePlaceholder
+    max_iterations: int
+
+    @attribute
+    def schema(self):
+        return self.placeholder.schema
+
+    @attribute
+    def values(self):
+        # Expose leaf columns instead of self-referential Fields. A Field
+        # pointing back at this relation would make DerefMap.backtrack loop
+        # forever (the recursion graph has no non-recursive leaf).
+        return FrozenOrderedDict(
+            {
+                name: RecursiveClosureColumn(rel=self, name=name)
+                for name in self.schema.names
+            }
+        )
+
+
+@public
+class RecursiveClosureColumn(Value):
+    """A leaf column reference bound to a :class:`RecursiveRelation`.
+
+    Ordinary column references are :class:`Field` nodes that dereference by
+    walking the relation hierarchy. A recursive graph has no non-recursive
+    leaf, so a self-referential Field would send that walk into an infinite
+    loop. This node terminates the walk: it is a columnar value directly
+    attached to the closure relation with the closure's declared dtype.
+    """
+
+    rel: RecursiveRelation
+    name: str
+
+    shape = ds.columnar
+
+    @attribute
+    def dtype(self):
+        return self.rel.schema[self.name]
+
+    @attribute
+    def relations(self):
+        return frozenset({self.rel})
+
+
+@public
 class PhysicalTable(Relation):
     """Base class for tables with a name."""
 
@@ -391,8 +472,8 @@ class Namespace(Concrete):
     them.
     """
 
-    catalog: Optional[str] = None
-    database: Optional[str] = None
+    catalog: str | None = None
+    database: str | None = None
 
 
 @public
@@ -475,7 +556,7 @@ class DropNull(Simple):
     """Drop null values in the table."""
 
     how: typing.Literal["any", "all"]
-    subset: Optional[VarTuple[Column]] = None
+    subset: VarTuple[Column] | None = None
 
 
 @public
