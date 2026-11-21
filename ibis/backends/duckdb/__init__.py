@@ -27,6 +27,11 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
 from ibis.backends import CanCreateDatabase, CanCreateSchema, UrlFromPath
+from ibis.backends.duckdb.bindings import (
+    BindingReader,
+    BindingSession,
+    eager_binding,
+)
 from ibis.backends.duckdb.converter import DuckDBPandasData
 from ibis.backends.sql import SQLBackend
 from ibis.backends.sql.compilers.base import STAR, AlterTable, C
@@ -321,6 +326,31 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
     @contextlib.contextmanager
     def _safe_raw_sql(self, *args, **kwargs):
         yield self.raw_sql(*args, **kwargs)
+
+    def compile(
+        self,
+        expr: ir.Expr,
+        limit: str | None = None,
+        params: Mapping[ir.Expr, Any] | None = None,
+        pretty: bool = False,
+        *,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
+    ) -> str:
+        """Compile an expression to DuckDB SQL.
+
+        When ``table_bindings`` is provided, unbound placeholders are
+        rewritten (without mutating the input expression) into references
+        to generated relation names that a later matching execution call
+        registers. Compilation itself never registers data, reads business
+        rows or modifies the catalog; the same mapping compiles and
+        executes identically because the name assignment comes from one
+        pure validation/rewrite step.
+        """
+        if table_bindings:
+            # validation only; the session is discarded without registering
+            session = BindingSession(self, expr, table_bindings)
+            expr = session.expr
+        return super().compile(expr, limit=limit, params=params, pretty=pretty)
 
     def list_catalogs(self, like: str | None = None) -> list[str]:
         col = "catalog_name"
@@ -1353,12 +1383,39 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
 
         super()._run_pre_execute_hooks(expr)
 
+    def _with_relation(
+        self,
+        expr: ir.Expr,
+        materialize,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
+    ):
+        """Compile and materialize ``expr`` while keeping bindings alive.
+
+        ``materialize`` receives the ``duckdb.DuckDBPyRelation`` and must
+        eagerly pull the results; relation bindings are unregistered only
+        after it returns (or raises, in which case they are rolled back).
+        """
+        self._run_pre_execute_hooks(expr)
+        table_expr = expr.as_table()
+        with eager_binding(self, table_expr, table_bindings) as bound:
+            if bound is not None:
+                table_expr = bound
+            sql = self.compile(table_expr, limit=limit, params=params)
+            if table_expr.schema().geospatial:
+                self._load_extensions(["spatial"])
+            relation = self.con.sql(sql)
+            return materialize(relation)
+
     def _to_duckdb_relation(
         self,
         expr: ir.Expr,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
     ):
         """Preprocess the expr, and return a `duckdb.DuckDBPyRelation` object.
 
@@ -1368,13 +1425,17 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         with the dbapi, we choose to only use them in select internal methods
         where performance might matter, and use the standard
         `duckdb_con.execute` everywhere else.
+
+        Relation bindings, if any, stay registered only for the duration of
+        the call, so the relation must be consumed eagerly.
         """
-        self._run_pre_execute_hooks(expr)
-        table_expr = expr.as_table()
-        sql = self.compile(table_expr, limit=limit, params=params)
-        if table_expr.schema().geospatial:
-            self._load_extensions(["spatial"])
-        return self.con.sql(sql)
+        return self._with_relation(
+            expr,
+            lambda relation: relation,
+            params=params,
+            limit=limit,
+            table_bindings=table_bindings,
+        )
 
     def to_pyarrow_batches(
         self,
@@ -1383,6 +1444,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
         chunk_size: int = 1_000_000,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
         **_: Any,
     ) -> pa.ipc.RecordBatchReader:
         """Return a stream of record batches.
@@ -1390,7 +1452,10 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         The returned `RecordBatchReader` contains a cursor with an unbounded lifetime.
 
         For analytics use cases this is usually nothing to fret about. In some cases you
-        may need to explicit release the cursor.
+        may need to explicit release the cursor. When ``table_bindings`` is
+        given, that lifetime is bound deterministically to the reader: the
+        binding registrations and cursor are released on exhaustion,
+        explicit ``close()`` or an error.
 
         ::: {.callout-warning}
         ## DuckDB returns 1024 size batches regardless of what value of `chunk_size` argument is passed.
@@ -1406,18 +1471,44 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             Limit the result to this number of rows
         chunk_size
             The number of rows to fetch per batch
+        table_bindings
+            Mapping of unbound table expressions (created with
+            ``ibis.table()``) to ``pyarrow.Table`` batches. A non-empty
+            mapping must bind every unbound table in the expression; the
+            data shadows any same-named catalog table for this call only.
         """
         self._run_pre_execute_hooks(expr)
         table = expr.as_table()
-        sql = self.compile(table, limit=limit, params=params)
 
-        def batch_producer(cur):
-            yield from cur.fetch_record_batch(rows_per_batch=chunk_size)
+        if not table_bindings:
+            sql = self.compile(table, limit=limit, params=params)
 
-        result = self.raw_sql(sql)
-        return pa.ipc.RecordBatchReader.from_batches(
-            expr.as_table().schema().to_pyarrow(), batch_producer(result)
-        )
+            def batch_producer(cur):
+                yield from cur.fetch_record_batch(rows_per_batch=chunk_size)
+
+            result = self.raw_sql(sql)
+            return pa.ipc.RecordBatchReader.from_batches(
+                expr.as_table().schema().to_pyarrow(), batch_producer(result)
+            )
+
+        # construction validates everything before any catalog mutation;
+        # if anything below raises, the ``except`` tears the session down so
+        # no partial registration survives
+        session = BindingSession(self, table, table_bindings)
+        try:
+            sql = self.compile(session.expr, limit=limit, params=params)
+            # replacement scans are connection local: use a dedicated child
+            # connection so interleaved readers (and concurrent eager calls
+            # on the backend) keep independent cursors and catalog entries
+            cursor = session.track_cursor(self.con.cursor())
+            session.register_all(cursor)
+            inner = cursor.execute(sql).fetch_record_batch(rows_per_batch=chunk_size)
+            # ownership of the session leaves this method here: the
+            # BindingReader closes it on exhaustion/error/explicit close
+            return BindingReader(inner, session, cursor)
+        except BaseException:
+            session.close()
+            raise
 
     def to_pyarrow(
         self,
@@ -1425,9 +1516,16 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
         **_: Any,
     ) -> pa.Table:
-        table = self._to_duckdb_relation(expr, params=params, limit=limit).arrow()
+        table = self._with_relation(
+            expr,
+            lambda relation: relation.arrow(),
+            params=params,
+            limit=limit,
+            table_bindings=table_bindings,
+        )
         return expr.__pyarrow_result__(table)
 
     def execute(
@@ -1435,13 +1533,21 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         expr: ir.Expr,
         params: Mapping | None = None,
         limit: str | None = "default",
+        *,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
         **_: Any,
     ) -> Any:
         """Execute an expression."""
         import pandas as pd
         import pyarrow.types as pat
 
-        table = self._to_duckdb_relation(expr, params=params, limit=limit).arrow()
+        table = self._with_relation(
+            expr,
+            lambda relation: relation.arrow(),
+            params=params,
+            limit=limit,
+            table_bindings=table_bindings,
+        )
 
         df = pd.DataFrame(
             {
@@ -1469,6 +1575,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
+        table_bindings: Mapping[ir.Table, pa.Table] | None = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         """Execute an expression and return results as a dictionary of torch tensors.
@@ -1481,6 +1588,8 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             Parameters to substitute into the expression.
         limit
             An integer to effect a specific row limit. A value of `None` means no limit.
+        table_bindings
+            Mapping of unbound table expressions to ``pyarrow.Table`` batches.
         kwargs
             Keyword arguments passed into the backend's `to_torch` implementation.
 
@@ -1490,7 +1599,13 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
             A dictionary of torch tensors, keyed by column name.
 
         """
-        return self._to_duckdb_relation(expr, params=params, limit=limit).torch()
+        return self._with_relation(
+            expr,
+            lambda relation: relation.torch(),
+            params=params,
+            limit=limit,
+            table_bindings=table_bindings,
+        )
 
     @util.experimental
     def to_parquet(

@@ -1,0 +1,32 @@
+--- batch 2026-11-20 ---
+  customer  order_count  revenue
+0      ada            2     15.0
+1    grace            1      7.5
+--- batch 2026-11-21 ---
+  customer  order_count  revenue
+0      ada            1     20.0
+1      lin            1      8.0
+execute:
+   customer  order_count  revenue
+0      lin            1      4.0
+to_pyarrow:
+ pyarrow.Table
+customer: string
+order_count: int64
+revenue: double
+----
+customer: [["lin"]]
+order_count: [[1]]
+revenue: [[4]]
+batches rows: 1
+compile:
+ SELECT * FROM (SELECT "t1"."customer", COUNT("t1"."order_id") AS "order_count", SUM("t1"."amount") AS "revenue" FROM (SELECT * FROM "ibis_duckdb_binding_a1c12ad592fac867" AS "t0" WHERE "t0"."amount" > 0) AS "t1" GROUP BY 1) AS "t2" ORDER BY "t2"."customer" ASC
+expression entry point:
+   customer  order_count  revenue
+0      lin            1      4.0
+params + bindings:
+ Empty DataFrame
+Columns: [order_id, customer, amount]
+Index: []
+
+catalog stays empty: []

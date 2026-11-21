@@ -375,10 +375,41 @@ class Expr(Immutable, Coercible):
 
         return backends[0]
 
+    def _resolve_backend(
+        self,
+        *,
+        use_default: bool,
+        table_bindings: Mapping[ir.Table, Any] | None,
+    ) -> BaseBackend:
+        """Select the backend for an entry point call.
+
+        When relation bindings are supplied, unbound placeholders are
+        resolvable without any catalog table, so an otherwise-unbound
+        expression may fall back to the default backend. Without bindings
+        the historical backend-resolution rules and error message are
+        preserved exactly.
+        """
+        if table_bindings:
+            backends, _ = self._find_backends()
+            if not backends:
+                default = _default_backend() if use_default else None
+                if default is None:
+                    raise IbisError(
+                        "Expression depends on no backends, and found no default"
+                    )
+                return default
+            if len(backends) > 1:
+                raise IbisError("Multiple backends found for this expression")
+            return backends[0]
+        return self._find_backend(use_default=use_default)
+
     def execute(
         self,
         limit: int | str | None = "default",
         params: Mapping[ir.Value, Any] | None = None,
+        *,
+        backend: BaseBackend | None = None,
+        table_bindings: Mapping[ir.Table, Any] | None = None,
         **kwargs: Any,
     ):
         """Execute an expression against its backend if one exists.
@@ -390,11 +421,27 @@ class Expr(Immutable, Coercible):
             "no limit". The default is in `ibis/config.py`.
         params
             Mapping of scalar parameter expressions to value
+        backend
+            Explicit backend to execute against. If omitted, the backend
+            attached to the expression (or the default backend) is used
+        table_bindings
+            Mapping of unbound table expressions (created with
+            `ibis.table()`) to per-batch data objects (for example
+            `pyarrow.Table`); supported by backends implementing relation
+            bindings, e.g. DuckDB
         kwargs
             Keyword arguments
         """
-        return self._find_backend(use_default=True).execute(
-            self, limit=limit, params=params, **kwargs
+        if backend is None:
+            backend = self._resolve_backend(
+                use_default=True, table_bindings=table_bindings
+            )
+        return backend.execute(
+            self,
+            limit=limit,
+            params=params,
+            table_bindings=table_bindings,
+            **kwargs,
         )
 
     def compile(
@@ -402,6 +449,9 @@ class Expr(Immutable, Coercible):
         limit: int | None = None,
         params: Mapping[ir.Value, Any] | None = None,
         pretty: bool = False,
+        *,
+        backend: BaseBackend | None = None,
+        table_bindings: Mapping[ir.Table, Any] | None = None,
     ):
         """Compile to an execution target.
 
@@ -414,9 +464,25 @@ class Expr(Immutable, Coercible):
             Mapping of scalar parameter expressions to value
         pretty
             In case of SQL backends, return a pretty formatted SQL query.
+        backend
+            Explicit backend to compile against. If omitted, the backend
+            attached to the expression is used
+        table_bindings
+            Mapping of unbound table expressions (created with
+            `ibis.table()`) to per-batch data objects (for example
+            `pyarrow.Table`); supported by backends implementing relation
+            bindings, e.g. DuckDB
         """
-        return self._find_backend().compile(
-            self, limit=limit, params=params, pretty=pretty
+        if backend is None:
+            backend = self._resolve_backend(
+                use_default=False, table_bindings=table_bindings
+            )
+        return backend.compile(
+            self,
+            limit=limit,
+            params=params,
+            pretty=pretty,
+            table_bindings=table_bindings,
         )
 
     @experimental
@@ -426,6 +492,8 @@ class Expr(Immutable, Coercible):
         limit: int | str | None = None,
         params: Mapping[ir.Value, Any] | None = None,
         chunk_size: int = 1_000_000,
+        backend: BaseBackend | None = None,
+        table_bindings: Mapping[ir.Table, Any] | None = None,
         **kwargs: Any,
     ) -> pa.ipc.RecordBatchReader:
         """Execute expression and return a RecordBatchReader.
@@ -442,6 +510,14 @@ class Expr(Immutable, Coercible):
             Mapping of scalar parameter expressions to value.
         chunk_size
             Maximum number of rows in each returned record batch.
+        backend
+            Explicit backend to execute against. If omitted, the backend
+            attached to the expression (or the default backend) is used
+        table_bindings
+            Mapping of unbound table expressions (created with
+            `ibis.table()`) to per-batch data objects (for example
+            `pyarrow.Table`); supported by backends implementing relation
+            bindings, e.g. DuckDB
         kwargs
             Keyword arguments
 
@@ -450,11 +526,16 @@ class Expr(Immutable, Coercible):
         results
             RecordBatchReader
         """
-        return self._find_backend(use_default=True).to_pyarrow_batches(
+        if backend is None:
+            backend = self._resolve_backend(
+                use_default=True, table_bindings=table_bindings
+            )
+        return backend.to_pyarrow_batches(
             self,
             params=params,
             limit=limit,
             chunk_size=chunk_size,
+            table_bindings=table_bindings,
             **kwargs,
         )
 
@@ -464,6 +545,8 @@ class Expr(Immutable, Coercible):
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
+        backend: BaseBackend | None = None,
+        table_bindings: Mapping[ir.Table, Any] | None = None,
         **kwargs: Any,
     ) -> pa.Table:
         """Execute expression and return results in as a pyarrow table.
@@ -478,6 +561,14 @@ class Expr(Immutable, Coercible):
         limit
             An integer to effect a specific row limit. A value of `None` means
             "no limit". The default is in `ibis/config.py`.
+        backend
+            Explicit backend to execute against. If omitted, the backend
+            attached to the expression (or the default backend) is used
+        table_bindings
+            Mapping of unbound table expressions (created with
+            `ibis.table()`) to per-batch data objects (for example
+            `pyarrow.Table`); supported by backends implementing relation
+            bindings, e.g. DuckDB
         kwargs
             Keyword arguments
 
@@ -486,8 +577,16 @@ class Expr(Immutable, Coercible):
         Table
             A pyarrow table holding the results of the executed expression.
         """
-        return self._find_backend(use_default=True).to_pyarrow(
-            self, params=params, limit=limit, **kwargs
+        if backend is None:
+            backend = self._resolve_backend(
+                use_default=True, table_bindings=table_bindings
+            )
+        return backend.to_pyarrow(
+            self,
+            params=params,
+            limit=limit,
+            table_bindings=table_bindings,
+            **kwargs,
         )
 
     @experimental

@@ -1,0 +1,15 @@
+alternating batches:
+  ok: batch A filter -> [10, 30]
+  ok: batch B filter -> [50]
+  ok: batch A groups -> {'x': 40, 'y': 60}
+  ok: batch B groups -> {'x': 50, 'z': 60}
+  ok: graph remains unbound after repeated execution
+catalog table protection:
+  ok: catalog rows intact -> [(-2, 'z', -998), (-1, 'x', -999)]
+  ok: without bindings the catalog table is what gets read
+independent SQL cross-check:
+  ok: SQL matches batch A and ibis
+  ok: SQL matches batch B and ibis
+  ok: raw catalog table also intact
+
+ALL VERIFICATIONS PASSED

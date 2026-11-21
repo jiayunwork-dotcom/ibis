@@ -1,0 +1,9 @@
+baseline catalog objects: []
+round   0: catalog=[], probe holds data after close: False
+round  50: catalog=[], probe holds data after close: False
+round 100: catalog=[], probe holds data after close: False
+round 150: catalog=[], probe holds data after close: False
+after 200 rounds catalog objects: []
+max open cursors observed inside a round: 1
+backend still usable: (1,)
+LIFECYCLE OK

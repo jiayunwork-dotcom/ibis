@@ -137,6 +137,14 @@ class DuckDBCompiler(SQLGlotCompiler):
             ]
         )
 
+    def visit_BoundRelation(self, op, *, name, schema):
+        # A per-call relation binding (see ibis.backends.duckdb.bindings).
+        # It compiles to an ordinary table reference; the backing arrow
+        # data is registered under the generated name for the duration of
+        # a single call and shadows any same-named catalog table only on
+        # the connection used by that call.
+        return sg.table(name, quoted=self.quoted)
+
     def visit_ArrayDistinct(self, op, *, arg):
         return self.if_(
             arg.is_(NULL),

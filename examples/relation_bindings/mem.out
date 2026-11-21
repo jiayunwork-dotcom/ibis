@@ -1,0 +1,19 @@
+input rows: 1,000,000
+input arrow size: 29.9 MB
+RSS delta attributable to input: +44.8 MB
+
+streaming (to_pyarrow_batches):
+  time to first batch (1024 rows): 11.9 ms
+  total time:                        26.7 ms
+  batches:                           977
+  largest single batch:              31.1 KB
+  RSS at first batch vs before call: +36.1 MB (duckdb compute + input)
+  RSS after full drain:              +35.9 MB
+
+eager (to_pyarrow):
+  time to full table: 17.0 ms
+  output arrow size:  30.3 MB
+  RSS delta vs before: +61.3 MB
+
+streaming first-batch wait was 1.4x faster than full eager materialization
+STREAMING/MEMORY OK
