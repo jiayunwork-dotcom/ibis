@@ -345,8 +345,26 @@ def complete_reprojection(_, y):
     return y
 
 
+def _has_impure_value(relation):
+    """Whether any value produced by ``relation`` contains an impure node.
+
+    The projection/filter simplification rules below inline a projection's
+    values into a subsequent relation. That is sound for pure expressions but
+    would change the evaluation boundary of a side-effecting UDF: a value
+    referenced twice would be evaluated twice and a pruned value would not be
+    evaluated at all. Those rules therefore bail out when the relation they
+    would inline carries an impure value.
+    """
+    values = getattr(relation, "values", None)
+    if not values:
+        return False
+    return any(value.find(ops.Impure, filter=ops.Value) for value in values.values())
+
+
 @replace(p.Project(y @ p.Project))
 def subsequent_projects(_, y):
+    if _has_impure_value(y):
+        return _
     rule = p.Field(y, name) >> Item(y.values, name)
     values = {k: v.replace(rule, filter=ops.Value) for k, v in _.values.items()}
     return ops.Project(y.parent, values)
@@ -361,6 +379,8 @@ def subsequent_filters(_, y):
 
 @replace(p.Filter(y @ p.Project))
 def reorder_filter_project(_, y):
+    if _has_impure_value(y):
+        return _
     rule = p.Field(y, name) >> Item(y.values, name)
     preds = tuple(v.replace(rule, filter=ops.Value) for v in _.predicates)
 

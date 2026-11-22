@@ -152,7 +152,18 @@ class _UDF(abc.ABC):
             }
         )
 
-        return type(_make_udf_name(fn.__name__), (cls._base,), fields)
+        bases = (cls._base,)
+        if kwargs.get("side_effects", False):
+            # A UDF declared to have side effects must not be treated as a
+            # pure value: the optimizer is allowed to duplicate, inline or
+            # eliminate pure expressions, all of which would change how many
+            # times (and whether) the Python callback runs. Marking the node
+            # as `Impure` makes the existing rewrite rules preserve the
+            # evaluation boundary while leaving ordinary deterministic UDFs
+            # fully optimizable.
+            bases = (*bases, ops.Impure)
+
+        return type(_make_udf_name(fn.__name__), bases, fields)
 
     @classmethod
     def _make_wrapper(

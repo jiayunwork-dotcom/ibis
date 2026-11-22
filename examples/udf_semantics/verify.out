@@ -1,0 +1,44 @@
+
+=== reference: direct duckdb ===
+two call sites          -> 6 calls, rows=[(1, 4), (2, 5), (3, 6)]
+one named site, reused  -> 3 calls, rows=[(1, 2), (2, 3), (3, 4)]
+
+=== null_handling='special' ===
+scalar NULL        : 77
+column mixed       : [77, 2, 3]
+table              : [77, 2, 3]
+to_pyarrow batches : [{'f_0(x)': [77, 2, 3]}]
+
+=== exception_handling ===
+return_null        : None
+default propagates : InvalidInputException
+backend usable     : 5
+
+=== side_effects=True ===
+two call sites          -> 6 calls
+ a  b
+ 1  4
+ 2  5
+ 3  6
+named, reused           -> 3 calls
+ a  b
+ 1  2
+ 2  3
+ 3  4
+per-row b == a + 1      : True
+
+=== pyarrow UDF (batch protocol) ===
+compile calls           : 0
+rows=200000 arrow calls=98 (per batch, not per row)
+
+=== streaming memory ===
+calls at compile        : 0
+rows in first batch     : 4096
+calls before first batch: 69632
+calls at end            : 200000
+full payload if buffered: 40.0 MB
+largest batch           : 0.84 MB
+python peak (first/all) : 0.03 / 0.03 MB
+drained rows            : 200000
+
+UDF SEMANTICS OK

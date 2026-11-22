@@ -1767,6 +1767,11 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
         ]
         output_type = type_mapper.to_string(udf_node.dtype)
 
+        # Only forward the options that were explicitly provided so that
+        # DuckDB's own defaults (call the function even for NULL inputs, raise
+        # Python exceptions, treat the function as pure) are preserved.
+        config = dict(udf_node.__config__)
+
         def register_udf(con):
             return con.create_function(
                 name,
@@ -1774,6 +1779,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanCreateSchema, UrlFromPath):
                 input_types,
                 output_type,
                 type=_UDF_INPUT_TYPE_MAPPING[udf_node.__input_type__],
+                **config,
             )
 
         return register_udf
